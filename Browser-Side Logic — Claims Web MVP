@@ -1,0 +1,297 @@
+Browser-Side Logic — Claims Web MVP
+
+This document explains every piece of logic that runs inside the browser for the claims demo (a dual-face dapp: Admin Console + Provider Portal). It follows the code flow end-to-end and calls out roles, trust boundaries, data handled, contract interactions, event queries, and UX behaviors so engineers and reviewers can reason about correctness and security.
+
+High-Level Purpose & Trust Model
+
+Goal:
+Provide a single web UI that:
+
+Admin (engine owner): view vault balance, pause/unpause the engine, and manage rules, providers, and coverage.
+
+Provider (non-owner): submit claims and view their own historical outcomes (paid/rejected) from on-chain events.
+
+Trust split:
+
+Device (browser): Drives UX, builds transactions (writes with connected wallet), reads contract state & logs via RPC; no PHI handled here.
+
+Blockchain (L2 – Base Sepolia by default): Source of truth for program state and event history (payments/rejections, rules, registry, coverage, vault balance).
+
+No backend dependency:
+Reads go directly to a public JSON-RPC; writes use the user’s wallet. Admin/Provider role is inferred from on-chain ownership.
+
+Environment & Bootstrap
+
+Vite ENV (examples):
+
+VITE_CHAIN_ID (e.g., 84532)
+
+VITE_RPC_URL (e.g., https://sepolia.base.org
+)
+
+Addresses: VITE_ENGINE, VITE_RULES, VITE_PROVIDER_REGISTRY, VITE_ENROLLMENT, VITE_BANK, VITE_USDC (optional display)
+
+Providers & clients:
+
+Writes: ethers.BrowserProvider (MetaMask) + Signer for txs.
+
+Reads: dedicated ethers.JsonRpcProvider(RPC_URL) (avoid MetaMask limits/CORS; faster & stable for getLogs).
+
+Chain management:
+On connect, requests accounts, ensures chain (wallet_switchEthereumChain → fall back to wallet_addEthereumChain for Base Sepolia), then captures address + chainId.
+
+Role detection:
+Reads ClaimEngine.owner() and compares with address to decide Admin vs Provider UI (no off-chain ACLs).
+
+Minimal On-Chain Interfaces (ABIs used in the browser)
+
+ClaimEngine:
+
+Events: ClaimPaid(id, claimKey, provider, code, year, amount, visitIndex), ClaimRejected(claimKey, provider, code, year, reason)
+
+View/mutate: paused(), setPaused(bool), submit(bytes32 patientId, uint16 code, uint16 year)
+
+Bank:
+
+View: vaultBalance()
+
+Event: PaymentExecuted(claimId, to, amount, vaultBalanceAfter)
+
+Rules:
+
+View/mutate: getRule(code) → (enabled, price, maxPerYear), setRule(code, enabled, price, maxPerYear, label)
+
+ProviderRegistry:
+
+View/mutate: isActive(provider, year), setProvider(provider, active, startYear, endYear)
+
+Enrollment:
+
+View/mutate: isCovered(patientId, year), setCoverage(patientId, active, startYear, endYear)
+
+ABIs are minimal, only what the UI reads/writes.
+
+Data Types & Helpers (Browser)
+
+USDC formatting:
+Vault and rule prices are 6-decimals (bigint → string with trimmed trailing zeros).
+
+Patient ID validation:
+isBytes32Hex ensures 0x + 64 hex chars before submit/coverage writes.
+
+Address/chain display:
+Shortened wallet in header; chain id displayed for clarity.
+
+UI State & Screen Flows
+
+5.1 Top-level state
+
+provider (BrowserProvider) + signer + address + chainId
+
+readProvider (JsonRpcProvider)
+
+Contract handles: engineR/W, rulesR/W, provRegR/W, enrollR/W, bankR
+
+Admin/Provider role flags
+
+5.2 Admin Console
+Dashboard stats:
+
+Bank.vaultBalance() → “Vault (USDC)”
+
+ClaimEngine.paused() → engine paused state
+
+Owner address (short)
+
+Pause/Unpause:
+engineW.setPaused(!paused); then re-read paused().
+
+Rules Manager:
+
+getRule(code) to load.
+
+setRule(code, enabled, price(6dp), maxPerYear, label) to update.
+
+Shows human-friendly USDC preview from raw price.
+
+Providers Manager:
+
+isActive(addr, year) check.
+
+setProvider(addr, active, startYear, endYear) to manage allowlist and time window.
+
+Coverage Manager:
+
+Checks/sets coverage by patientId (bytes32) with start/end years.
+
+Validates bytes32 before write.
+
+5.3 Provider Portal
+Submit Claim:
+
+Inputs: patientId (bytes32), code, year.
+
+Previews Rules.getRule(code) (enabled, price), showing “disabled” if not payable.
+
+engineW.submit(patientId, code, year) → waits for receipt → parses logs:
+
+If ClaimPaid → show “Paid {amount} USDC · visit #{visitIndex}”; refresh vault.
+
+Else if ClaimRejected → show rejection reason.
+
+Else → “Tx mined, no event parsed.”
+
+Vault Snapshot:
+Displays Bank.vaultBalance(); note that underfunded vault causes rejections.
+
+My Claims (History):
+
+Queries events filtered by indexed provider using ethers v6 filters:
+
+filters.ClaimPaid(null, null, provider)
+
+filters.ClaimRejected(null, provider)
+
+Uses bounded block window + chunked log loader to respect RPC limits (10k block cap).
+
+Cursor in localStorage so reloads are incremental; “Load older” fetches previous window.
+
+Event Query Strategy (Efficient & Compatible)
+
+Problem:
+Many RPCs cap eth_getLogs to ~10k blocks per call.
+
+Solution implemented in the browser:
+
+Provider-indexed filters (server-side narrowing)
+Node returns only events where provider matches the connected wallet.
+
+Bounded window + cursor
+Default LOOKBACK (e.g., 9,000 blocks). Reloads advance a stored cursor so subsequent reads are tiny.
+
+Chunked queries
+Helper splits from..to into sub-ranges (≤9,500 blocks), merges results, halves chunk size on errors.
+
+Error Handling & Guardrails
+
+Wallet missing / wrong chain: Clear messaging; adds/switches Base Sepolia automatically.
+
+Invalid inputs: Patient ID must be bytes32; numeric fields parsed and guarded.
+
+Writes: All writes await tx.wait(); UI refreshes view state after success.
+
+Event scans: Loading spinners, small error banner; handles “no events in range.”
+
+RPC resilience: Dedicated read provider + chunked getLogs avoids MetaMask CORS/limits and RPC span caps.
+
+Data Handling Summary (Browser Only)
+
+No PHI processed or stored. Claim inputs are codes, years, and bytes32 patient IDs (pseudonymous).
+
+Local state includes wallet address, UI flags, and cached block cursor (localStorage: claims.fromBlock).
+
+All business outcomes (paid/rejected, amounts) come from on-chain events.
+
+Security Notes
+
+Authorization: Admin role is derived from ClaimEngine.owner() on-chain; Providers are wallets present in ProviderRegistry.
+
+Payments: ClaimPaid only emitted if rule & coverage & provider validations pass and Bank has sufficient USDC.
+
+Replay resistance: Transaction replays prevented by chain semantics.
+
+Privacy: Event data includes provider and non-PHI claim metadata. Patient ID is bytes32; never reveals PII.
+
+UX Blueprint (Actions → Effects)
+
+Connect Wallet → request accounts → ensure chain → detect role.
+
+Admin:
+
+Pause/Unpause → mutate engine → refresh paused().
+
+Rules → getRule + setRule → confirm + reread.
+
+Providers → isActive → setProvider → recheck.
+
+Coverage → isCovered → setCoverage → recheck.
+
+Provider:
+
+Submit → submit(patientId, code, year) → parse receipt events → show Paid/Rejected → refresh vault.
+
+History → filtered, bounded, chunked event query → table (newest first) with Basescan links.
+
+Pseudocode (Core Flows)
+
+On connect:
+wallet = BrowserProvider(window.ethereum)
+await wallet.send("eth_requestAccounts", [])
+await ensureChain(BASE_SEPOLIA)
+signer = await wallet.getSigner()
+readProvider = new JsonRpcProvider(RPC_URL)
+engineR = new Contract(ENGINE_ADDR, abi, readProvider)
+owner = await engineR.owner()
+isAdmin = (owner.toLowerCase() === address.toLowerCase())
+
+Provider: Submit Claim
+tx = await engineW.submit(patientId, code, year)
+rcpt = await tx.wait()
+ev = parseLogs(rcpt.logs)
+if (ev.ClaimPaid) showPaid(amount, visitIndex)
+if (ev.ClaimRejected) showRejected(reason)
+
+History: efficient logs
+to = await readProvider.getBlockNumber()
+from = cursor || (to - LOOKBACK)
+paidFilter = engineR.filters.ClaimPaid(null, null, address)
+rejFilter = engineR.filters.ClaimRejected(null, address)
+paidLogs = chunkedQuery(engineR, paidFilter, from, to, 9500)
+rejLogs = chunkedQuery(engineR, rejFilter, from, to, 9500)
+rows = normalize(paidLogs, rejLogs).filter(r => r.provider == address)
+render(rows.sortByBlockDesc())
+cursor = to + 1
+
+Future Hardening & Notes
+
+Live stream new events with readProvider.on(filter, ...) to update history in real time.
+
+More granular errors (surface revert reasons in submit path).
+
+Input masks for addresses/years.
+
+Pagination/export (CSV) for history.
+
+Feature flags (hide admin cards for non-owner completely).
+
+Testing Checklist (Engineer-Facing)
+
+[ ] No-wallet path shows connect CTA; wrong chain → add/switch works.
+[ ] Role detection: owner wallet sees Admin; non-owner sees Provider.
+[ ] Rules: load/write/readback works; price renders correctly.
+[ ] Providers: isActive reflects saved ranges; toggling active updates immediately.
+[ ] Coverage: bytes32 enforcement; set + recheck matches.
+[ ] Submit: valid patientId/code/year → Paid when vault funded; Rejected otherwise.
+[ ] Vault snapshot changes after Paid.
+[ ] History: loads within default lookback; “Load older” walks back; chunking avoids 10k RPC limit.
+[ ] No sensitive data in logs, URLs, or console.
+
+Glossary
+
+ClaimPaid / ClaimRejected:
+Engine outcome events consumed by the UI.
+
+vaultBalance:
+USDC available for paying claims.
+
+Rule (code):
+Enables a service and sets price + max claims/year per patient.
+
+Provider Active:
+Address allowed to submit in a given year window.
+
+Covered (patient):
+bytes32 patientId enabled for a year range.
+
+LOOKBACK / Cursor:
+Block window and saved start point for efficient incremental event queries.
