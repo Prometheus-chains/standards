@@ -1,0 +1,242 @@
+# Browser-Side Logic — Patient Web MVP
+
+This document explains every piece of logic that runs **inside the browser** for the patient snapshot MVP. It follows the code flow end‑to‑end and calls out trust boundaries, data handled, crypto, contract interactions, and UX behaviors so engineers and reviewers can reason about correctness and security.
+
+---
+
+## 1) High‑Level Purpose & Trust Model
+
+* **Goal:** Let a patient anchor a hash of plaintext FHIR JSON on L1 and store the encrypted plaintext on L2; then be able to deterministically restore/decrypt later on any device with their wallet.
+* **Trust split**
+
+  * **Device (browser):** *All* plaintext handling + crypto (canonicalization, hashing, encryption, decryption, key derivation). RAM only by default.
+  * **L1 (PatientRecord):** Append‑only timeline of `(index i → contentHash, l2ChainId)` — no PHI, integrity only.
+  * **L2 (Vault):** Ciphertext bytes + private, pseudorandom `tag` for lookup — no plaintext.
+* **No public cross‑link:** Nothing on L1 appears on L2 that could link entries without the device‑local secret derivation.
+
+---
+
+## 2) Environment & Process Bootstrap
+
+* Read **Vite ENV** at load: `l1Id`, `l1Url`, `l2Id`, `l2Url`, `factory` (L1), `vault` (L2).
+* Initialize **public JSON‑RPC clients** with viem: `l1Public`, `l2Public`.
+* **Wallet clients** are created lazily and bound to the current MetaMask provider for L1 or L2 actions.
+* **Chain management:** `ensureChain(targetId, rpcUrl?)` switches/installs networks in MetaMask (handles 4902 add‑chain flow). Fails fast if MetaMask is missing.
+* **Sanity checks:** `assertCodeAtL1/L2(address)` fetch bytecode and error if not a contract (prevents writing to wrong chain/address).
+
+---
+
+## 3) Minimal Interfaces (Browser‑Side Views of On‑Chain Contracts)
+
+* **PatientRecordFactory (L1)**
+
+  * `recordOf(owner) → address`
+  * `createRecord() → address`
+* **PatientRecord (L1)**
+
+  * `seq() → uint64`
+  * `contentHashAt(uint64) → bytes32`
+  * `anchor(bytes32 contentHash, uint32 l2ChainId) → uint64`
+* **Vault (L2)**
+
+  * `put(bytes ciphertext, bytes16 tag) → bytes32 envelopeId`
+  * `getCiphertextByTag(bytes16) → bytes`
+  * `getEnvelopeIdByTag(bytes16) → bytes32`
+  * `getCiphertext(bytes32) → bytes`
+
+> These ABIs are duplicated minimally in the app for tight coupling to on‑chain interfaces.
+
+---
+
+## 4) Crypto & Deterministic Derivation (All In‑Browser)
+
+### 4.1 Canonicalization & Hashing
+
+* Parse user‑provided FHIR JSON → **stable stringify** (no spaces) → **SHA‑256** → `contentHash (bytes32)`.
+* Only `contentHash` is written to L1 (never plaintext).
+
+### 4.2 Session Root via EIP‑712 Signature (RAM‑only)
+
+* The wallet signs typed data **once per session** with domain pinned to `chainId=L1` and `verifyingContract=recordAddr`.
+* The raw signature bytes are SHA‑256‑hashed → 32‑byte **session root**; not persisted.
+
+### 4.3 Index‑Based Derivation (per event i)
+
+```
+base  = "PC-DERIVE-ROOT-I" || root || bytes(recordAddr) || u64be(i)
+tag   = SHA256("TAG"   || base)[0..15]   // bytes16, Vault key
+key   = SHA256("KEY"   || base)          // 32 bytes, AES‑256‑GCM key
+nonce = SHA256("NONCE" || base)[0..11]   // 12 bytes, AES‑GCM IV
+```
+
+* **Independence:** `tag` is unlinkable to `key/nonce`.
+* **Nonce uniqueness:** Guaranteed by unique `(recordAddr, i)` (and different roots per session/device). If index reuse were ever allowed, mix `contentHash` into NONCE (future‑proofing noted).
+
+### 4.4 AEAD
+
+* **AES‑GCM (256‑bit)** using WebCrypto: encrypt/decrypt of the canonical plaintext buffer.
+
+---
+
+## 5) UI State & Data Flow (React)
+
+* **State atoms**
+
+  * `account` (wallet), `recordAddr` (PatientRecord), `status` (UX), `jsonText` (plaintext input), `hashHex` (last L1 contentHash), `l2Tag` (last tag), `lastTx` (last tx hash), `root` (session root Uint8Array), `restoreResults` (per‑index verification rows).
+
+### 5.1 Connect Wallet
+
+* `connect()` → request accounts → set `account`.
+
+### 5.2 Ensure PatientRecord (L1)
+
+1. `ensureChain(L1)`.
+2. `assertCodeAtL1(factory)`.
+3. Call `recordOf(account)`:
+
+   * If zero: simulate `createRecord()` with `l1Public.simulateContract`, then `wallet.writeContract(request)` + wait 1 conf. Re‑read `recordOf` and set `recordAddr`.
+4. Update status with the resolved record address.
+
+### 5.3 Authorize Key Derivation (EIP‑712)
+
+* Requires `recordAddr`.
+* `deriveRootViaSignature(recordAddr)` → set `root` in memory → show “key derivation active”.
+
+### 5.4 Hash & Anchor to L1
+
+1. Guard: have `recordAddr`.
+2. `ensureChain(L1)`.
+3. Canonicalize + SHA‑256 → `hashHex`.
+4. Simulate `PatientRecord.anchor(hashHex, l2Id)` (account = wallet L1), then write tx and await 1 conf.
+5. UX hint: Scroll to quick actions.
+
+### 5.5 Encrypt & Store to L2 (Anchor‑First Discipline)
+
+1. Guards: `account`, `recordAddr`, `root`.
+2. Read `seq()` from L1 → must be `≥ 1`. Let `i = seq` (the just‑anchored index).
+3. `ensureChain(L2)` and `assertCodeAtL2(vault)`.
+4. Canonicalize plaintext again (no hidden mutation).
+5. Derive `{tagHex, keyBytes, nonce}` from `(root, recordAddr, i)`.
+6. `ciphertext = AES‑GCM(keyBytes, nonce, canonical)`.
+7. Simulate & send `Vault.put(ciphertext, tagHex)`; await 1 conf.
+8. Store `l2Tag = tagHex` for display.
+
+### 5.6 Restore Timeline (New/Any Device)
+
+1. Guards: `recordAddr`, `root`.
+2. Read `N = seq()` from L1.
+3. For `i = 1..N`:
+
+   * `ch = contentHashAt(i)` from L1.
+   * Derive `{tagHex,keyBytes,nonce}`.
+   * Try `getCiphertextByTag(tagHex)`; fallback to `getEnvelopeIdByTag(tagHex)` → `getCiphertext(envelopeId)`.
+   * Decrypt with WebCrypto; `ok = SHA256(pt) === ch`.
+   * Build `preview` by JSON parse + stringify slice.
+4. Present list with per‑row status: ✅ verified, ⚠ missing on L2, ❌ hash mismatch. Provide **download** buttons:
+
+   * **Ciphertext:** raw bytes, no checks.
+   * **Decrypted FHIR:** only if `ok` (hash match) to avoid exporting unverifiable plaintext.
+
+---
+
+## 6) Error Handling & Guardrails
+
+* **MetaMask missing** → alerts and status messages.
+* **Wrong chain** → auto switch/add via `ensureChain`.
+* **Wrong address** → `assertCodeAtL1/L2` prevents ghost calls.
+* **Order requirement** → L2 store refuses when `seq == 0` (forces anchor‑first).
+* **JSON validity** → failures bubble from parse/stringify; UX should validate JSON before enabling buttons (future polish).
+* **Simulation first** → all writes are preflighted with `simulateContract` to fail fast.
+* **Restore resilience** → handles missing L2 entries gracefully.
+
+---
+
+## 7) Data Handling Summary (Browser Only)
+
+* **Plaintext FHIR JSON**: Temporarily in memory from textarea → canonicalized Uint8Array → encrypted. Not persisted by the app.
+* **Session root**: Uint8Array (32 bytes), RAM only; derived from EIP‑712 signature.
+* **Computed artifacts**: `hashHex`, `tagHex`, `ciphertext` (transient), `nonce` (transient), `keyBytes` (transient). Only `hashHex` and `tagHex` are shown in UI for transparency.
+
+---
+
+## 8) Security & Privacy Notes
+
+* **No PHI leaves device unencrypted.**
+* **On‑chain disclosures**:
+
+  * L1: index ordering + content hash (collision‑resistant fingerprint).
+  * L2: ciphertext + tag (pseudorandom, secret‑derived).
+* **Replay & nonce:** Index‑based derivation ensures unique `(key,nonce)` per index; re‑encrypting the same canonical plaintext still yields different ciphertext if the root changes (new session), but integrity check is bound to L1 hash.
+* **Signature scope:** Domain binds to the specific `PatientRecord` and L1 chain, avoiding cross‑contract replay.
+
+---
+
+## 9) UX Blueprint (Buttons → Effects)
+
+* **Connect Wallet** → `connect()`.
+* **Check / Create L1 PatientRecord** → ensure L1 → read or create via factory → show address.
+* **Authorize key derivation (sign)** → EIP‑712 → set session root.
+* **Generate Hash & Anchor to L1** → canonicalize + hash → simulate+send `anchor`.
+* **Encrypt & Store to L2 Vault** → read `seq`, derive, encrypt, `put` to Vault.
+* **Restore timeline** → loop i=1..N, fetch/decrypt/verify → render results with download actions.
+
+---
+
+## 10) Pseudocode (Single Screen Reference)
+
+```js
+// 0) one‑time per session
+root = sha256(signTypedData(domain{recordAddr, chainId:L1}, msg{purpose, l2:L2_ID}))
+
+// 1) anchor
+canonical = stableStringify(JSON.parse(jsonText))
+contentHash = sha256(canonical)
+i = write PatientRecord.anchor(contentHash, L2_ID)  // returns seq
+
+// 2) store (for same i)
+{tag,key,nonce} = derive(root, recordAddr, i)
+ciphertext = AESGCM_Encrypt(key, nonce, canonical)
+Vault.put(ciphertext, tag)
+
+// 3) restore
+N = PatientRecord.seq()
+for i in 1..N:
+  ch = contentHashAt(i)
+  {tag,key,nonce} = derive(root, recordAddr, i)
+  ct = Vault.getCiphertextByTag(tag) || getCiphertext(getEnvelopeIdByTag(tag))
+  pt = AESGCM_Decrypt(key, nonce, ct)
+  ok = sha256(pt) === ch
+```
+
+---
+
+## 11) Future Hardening & Notes
+
+* Mix `contentHash` into NONCE derivation if we ever support re‑anchoring at the same index.
+* JSON schema validation for FHIR Bundle before allowing anchor.
+* Optional local‑at‑rest encrypted cache (with user consent) to avoid copy‑paste loss.
+* Gas abstraction via relayer or paymaster for smoother UX (non‑custodial; server never sees tokens/PHI).
+* SMART on FHIR ingestion on mobile/web to replace textarea; same publish/restore logic applies.
+
+---
+
+## 12) Testing Checklist (Engineer‑Facing)
+
+* [ ] No‑wallet path shows clear error.
+* [ ] Wrong chain prompts add/switch and recovers.
+* [ ] Factory/vault bytecode check rejects bad addresses.
+* [ ] Invalid JSON → UI blocks anchor/store.
+* [ ] Anchor then store: `seq` increments; L2 tag present; both txs confirm.
+* [ ] Restore on fresh session: signature required; N entries enumerated; decrypt & verify all; missing L2 handled.
+* [ ] Downloaded decrypted JSON matches original; export blocked on hash mismatch.
+* [ ] No PHI appears in logs, errors, or URLs.
+
+---
+
+## 13) Glossary
+
+* **contentHash**: SHA‑256 of canonical plaintext FHIR JSON.
+* **tag**: 16‑byte secret‑derived identifier used to look up ciphertext in the Vault.
+* **envelopeId**: keccak256(ciphertext), returned by Vault; optional for reads.
+* **seq / index i**: 1‑indexed position of the event in PatientRecord.
+* **root**: Session‑scoped 32‑byte secret derived from an EIP‑712 signature.
